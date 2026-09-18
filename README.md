@@ -55,6 +55,26 @@ The integrations depend on externally installed simulator and policy environment
 4. The container entry is `hybrid_rollout/robodojo/cluster_entrypoint.sh`; `acp.py` is an optional SenseCore-specific submission adapter. A container runs one explicit case, saves artifacts, and cleans up its own components. Cluster-specific campaign migration helpers require deployment-local plans and are not a one-command public launch recipe.
 5. Use `public_results/evaluation_cases.json` to align task, scene and seed across policies. Each case has one hybrid and one Direct result. Set `ROLLOUT_EVALUATION_METHOD=pi05_plus_gpt` or `gpt_only`; the latter is an internal CLI identifier for GPT 6 Astra Direct and does not launch π₀.₅.
 
+### π₀.₅-only baseline (no GPT, no credentials)
+
+`hybrid_rollout/robodojo/run_pi05_only.sh` runs one frozen case with the same simulator session, case identity and native scoring as the other two methods, but with π₀.₅ acting alone: each 50-step chunk is executed completely before the next inference, as in XPolicyLab's `Pi_05/deploy.py`. One GPU is enough; the policy server and Isaac Sim share it by default.
+
+1. Clone RoboDojo at the recorded commit, with submodules at their pinned gitlinks (not `--remote`), and download `Assets/**` from the `RoboDojo-Benchmark/RoboDojo` Hugging Face dataset into `src/RoboDojo/Assets`.
+2. Create an Isaac Sim 5.1 Python 3.11 environment by following RoboDojo `scripts/install.sh` (Isaac Sim, IsaacLab, cuRobo, plus `imageio-ffmpeg`). Also install the OpenPI environment with `uv sync --group lerobot` in `XPolicyLab/policy/Pi_05/openpi`; without the `lerobot` group, OpenPI fails at import.
+3. Download the official checkpoint `ckpt/RoboDojo/Pi_05/RoboDojo-sim-arx_x5-joint-0/59999` from the same dataset. Inference needs only `params/`, `assets/` and `_CHECKPOINT_METADATA`, not `train_state/`. Its identity hash is `d15fb8bd…3e5b`, the `previous_load_sha256` in `SOURCE.json`.
+4. Verify the assets against the frozen panel: `python -m hybrid_rollout.robodojo.evaluation --source <RoboDojo> --manifest hybrid_rollout/robodojo/eval_panels/robodojo_panel60_v1.json`.
+5. Run one case, or loop or array over the 50 IDs printed by `python -m hybrid_rollout.robodojo.pi05_only cases --scope hybrid_rollout/robodojo/eval_panels/robodojo_panel50_scope_v2.json`:
+
+```sh
+RUNTIME_ROOT=/path/with/src-RoboDojo_sim-venv_checkpoints \
+ROBODOJO_PYTHON=/path/to/sim-venv/bin/python \
+ROLLOUT_CASE_ID=build_tower__standard__g0__l0 \
+bash hybrid_rollout/robodojo/run_pi05_only.sh
+python -m hybrid_rollout.robodojo.pi05_only_summary --results "$RUNTIME_ROOT/results/pi05_only_panel50" --output summary/
+```
+
+The summary compares the per-task score and success rate with the leaderboard π₀.₅ and the report's hybrid and Direct results. `robodojo_server/runtime.sh` uses the host's installed NVIDIA Vulkan/EGL driver libraries when no private graphics runtime is provided.
+
 The model is fixed to `gpt-6-astra` with `xhigh` reasoning. No provider fallback is implied. You need your own authorized account or gateway access. Policy/model execution can incur costs. Read the skills and action contract before launching; no simulation or model calls are made by the preview or offline tests.
 
 ### Deployment and security boundaries
