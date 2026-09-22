@@ -40,20 +40,10 @@ def test_padding_planes_never_activate():
     pieces = [(0, *geo.hull_planes(small), small), (1, *geo.hull_planes(wedge), wedge)]
     convex = geo.ConvexSet.from_pieces(pieces)
     assert convex.normals.shape[1] == 6 and torch.isinf(convex.offsets[1, 4:]).all()
-    sdf, _ = geo.convex_sdf(convex.normals, convex.offsets, torch.tensor([[[0.0, 0, 0]], [[0.002, 0.002, 0.002]]]))
-    assert sdf[0, 0] == pytest.approx(-0.01, abs=1e-6)
-    assert sdf[1, 0] == pytest.approx(-0.002, abs=1e-6)
-
-
-def test_sdf_depth_and_gradient_in_world():
-    convex = box()
-    pos, quat = identity_pose((1.0, 2.0, 3.0))
-    points = torch.tensor([[1.0, 2.0, 3.009], [1.0, 2.0, 3.05]])
-    local = geo.to_piece_frames(convex, pos, quat, points)
-    sdf, grad = geo.convex_sdf(convex.normals, convex.offsets, local)
-    assert sdf[0, 0] == pytest.approx(-0.001, abs=1e-6)
-    assert torch.allclose(grad[0, 0], torch.tensor([0, 0, 1.0]))
-    assert sdf[0, 1] > 0
+    origins = torch.tensor([[[-0.1, 0.002, 0.002], [-0.1, 0.019, 0.019]]]).expand(2, -1, -1)
+    t, _ = geo.ray_entry(convex.normals, convex.offsets, origins, torch.tensor([1.0, 0, 0]).expand(2, 2, 3))
+    assert t[0, 0] == pytest.approx(0.09, abs=1e-6) and t[1, 0] == pytest.approx(0.1, abs=1e-6)
+    assert torch.isinf(t[1, 1])            # beyond the wedge's slanted face
 
 
 def test_rotated_body_frames():
@@ -85,17 +75,9 @@ def test_gel_height_from_ray_gap():
     assert np.allclose(height.numpy()[~inside], 0.0)
 
 
-def test_splat_preserves_total_force():
-    u, v = geo.pad_grid((-0.015, 0.072), (-0.031, 0.031), 24, 16)
-    assert u[0, 0] > u[-1, 0]  # fingertip on the top row
-    grid = geo.splat([0.03, 0.0], [0.0, 0.01], [2.0, 1.0], u, v, 0.002)
-    assert grid.sum() == pytest.approx(3.0, rel=0.02)
-    row, col = np.unravel_index(grid.argmax(), grid.shape)
-    assert abs(u[row, col] - 0.03) < 0.004 and abs(v[row, col]) < 0.004
-    vectors = geo.splat([0.03], [0.0], [[1.0, -2.0]], u, v, 0.002)
-    assert vectors.shape == (24, 16, 2)
-    assert vectors[..., 1].sum() == pytest.approx(-2.0, rel=0.02)
-    assert geo.splat([], [], np.zeros(0), u, v, 0.002).shape == (24, 16)
+def test_pad_grid_puts_the_fingertip_on_top():
+    u, v = geo.pad_grid((0.0, 0.03), (-0.01, 0.01), 3, 2)
+    assert np.allclose(u[:, 0], [0.025, 0.015, 0.005]) and np.allclose(v[0], [-0.005, 0.005])
 
 
 def test_quaternion_round_trip():
@@ -107,21 +89,13 @@ def test_quaternion_round_trip():
                           torch.tensor([[np.cos(np.pi / 4), 0, -np.sin(np.pi / 4)]], dtype=torch.float32), atol=1e-6)
 
 
-def test_patch_pressure_fills_the_face_contact_polygon():
-    u, v = geo.pad_grid((0.020, 0.080), (-0.024, 0.024), 24, 20)
-    corners_u, corners_v = [0.056, 0.056, 0.071, 0.071], [-0.010, 0.008, -0.010, 0.008]
-    grid = geo.patch_pressure(corners_u, corners_v, [5.0, 5.0, 5.0, 5.0], u, v, 0.0015)
-    assert grid.sum() == pytest.approx(20.0)
-    inside = (u > 0.056) & (u < 0.071) & (v > -0.010) & (v < 0.008)
-    assert grid[~inside].sum() == 0 and (grid[inside] > 0).all()
-    assert np.ptp(grid[inside]) < 1e-9          # equal corner forces: uniform pressure
-    tilted = geo.patch_pressure(corners_u, corners_v, [1.0, 1.0, 9.0, 9.0], u, v, 0.0015)
-    assert tilted[inside & (u > 0.066)].mean() > 3 * tilted[inside & (u < 0.061)].mean()
-
-
-def test_patch_pressure_falls_back_for_edge_and_point_contacts():
-    u, v = geo.pad_grid((0.020, 0.080), (-0.024, 0.024), 24, 20)
-    edge = geo.patch_pressure([0.05, 0.06, 0.07], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], u, v, 0.0015)
-    point = geo.patch_pressure([0.05], [0.0], [2.0], u, v, 0.0015)
-    assert edge.sum() == pytest.approx(3.0, rel=0.03) and point.sum() == pytest.approx(2.0, rel=0.03)
-    assert geo.patch_pressure([0.05], [0.0], [0.0], u, v, 0.0015).sum() == 0
+def test_mounted_camera_looks_out_through_the_gel_with_the_tip_up():
+    pytest.importorskip('scipy')
+    from scipy.spatial.transform import Rotation
+    from hybrid_rollout.robodojo.tactile.mounted import _camera_rotation, _quat_wxyz
+    for sign in (-1.0, 1.0):
+        rotation = _camera_rotation(sign)
+        w, x, y, z = _quat_wxyz(rotation)
+        assert np.allclose(Rotation.from_quat([x, y, z, w]).as_matrix(), rotation, atol=1e-6)
+        assert np.allclose(rotation @ [0, 0, -1], [0, sign, 0])   # looks along the gripping-face normal
+        assert np.allclose(rotation @ [0, 1, 0], [1, 0, 0])       # image up = toward the fingertip

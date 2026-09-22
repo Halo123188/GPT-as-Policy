@@ -88,12 +88,17 @@ def main():
         for robot in cfg.robot.robots:
             robot.need_planner = False
         tactile_factory = None
-        if os.environ.get('ROBODOJO_TACTILE') == '1':
-            # Observation-only tactile sensing; contact reporting must exist before the robot spawns.
+        tactile = os.environ.get('ROBODOJO_TACTILE')
+        if tactile in ('1', 'mounted'):
+            # Contact reporting (and, when mounted, the gel pads) must exist before the robot spawns.
+            # '1' is observation-only; 'mounted' makes the fingertips compliant.
             from functools import partial
-            from ..tactile.recorder import TactileRecorder, enable_contact_reporting
+            from ..tactile.recorder import TactileRecorder, enable_contact_reporting, mount_gelsight
             enable_contact_reporting()
-            tactile_factory = partial(TactileRecorder, calibration_root=os.environ['ROBODOJO_TACTILE_CALIBRATION'])
+            if tactile == 'mounted':
+                mount_gelsight()
+            tactile_factory = partial(TactileRecorder, calibration_root=os.environ['ROBODOJO_TACTILE_CALIBRATION'],
+                                      mounted=tactile == 'mounted')
         original = eval_env.WsModelClient
         try:
             eval_env.WsModelClient = NoPolicyConnection

@@ -1,8 +1,10 @@
 """In-simulator tactile recorder for the dual ARX X5 (import only inside a running Isaac Sim app).
 
-All three models are observation-only: contact reporting is enabled on the robot links, but no
-collision shape, material, mass or solver setting changes, so the rollout physics is the same as
-without sensing.
+The contact sensor and GelSight (virtual gel) are observation-only: contact reporting is enabled
+on the robot links, but no collision shape, material, mass or solver setting changes, so the
+rollout physics is the same as without sensing. GelSight real (``mounted=True``) replaces the
+virtual gel with a flat compliant pad and a depth camera, and does change the fingertip contact;
+see mounted.py.
 
 Frames (per finger link, from Assets/Robots/x5/ARX.usd): +x runs from the finger root to the
 tip, z spans the finger width, and the gripping face points along -y on link7 and +y on link8.
@@ -17,17 +19,15 @@ import numpy as np
 import torch
 
 from . import geometry as geo
+from .mounted import MOUNT, MountedGel, mount_gel_pads
 
 FINGERS = (('link7', -1.0), ('link8', 1.0))  # link, sign of the gripping-face normal along local y
-# Taxel skin over the distal 60 mm of the gripping face (2.5 x 2.4 mm cells). PhysX reports the
-# flat fingertip pad's contacts at u = 55-74 mm, just past the hull tip (x = 71 mm) by the contact offset.
-TAXEL = dict(u_range=(0.020, 0.080), v_range=(-0.024, 0.024), rows=24, cols=20, sigma=0.0015,
-             inner_y=0.006)  # contacts with sign*y > inner_y lie on the gripping half of the finger
 # GelSight R1.5 calibration (the only TacSL calibration published for Isaac Sim 5.1): 320x240 px,
-# 0.0877 mm/px -> a 28.1 x 21.0 mm gel on the fingertip, covering the flat tip face.
+# 0.0877 mm/px -> a 28.1 x 21.0 mm window on the fingertip, covering the flat tip face.
+# Only the image a real GelSight produces is simulated: TacSL's penalty force field is not.
 GEL = dict(tip_u=0.071, v_center=-0.0012, rows=320, cols=240, mm_per_pixel=0.0877,
-           thickness=0.001, margin=0.003, field=(20, 15), k_n=100.0, k_t=1.0, mu=2.0,
            calibration='gelsight_r15_data')
+VIRTUAL = dict(thickness=0.001, margin=0.003)  # GelSight: a 1 mm gel layer that never touches physics
 HEIGHT_POOL = 4  # stored height maps are 4x4 max-pooled (80 x 60)
 
 
@@ -44,6 +44,11 @@ def enable_contact_reporting():
 
     with_contact_reporting.tactile_contact_reporting = True
     x5.get_robot_config = with_contact_reporting
+
+
+def mount_gelsight():
+    """GelSight real: spawn the X5 with gel pads and tactile cameras (before the environment exists)."""
+    mount_gel_pads(GEL, FINGERS)
 
 
 def _matrix(xform_cache, prim):
@@ -90,14 +95,13 @@ def _numpy(tensor):
 
 
 def _pose(view):
-    """World position (N, 3), wxyz quaternion (N, 4), COM velocity (N, 6), COM in body (N, 3)."""
+    """World position (N, 3) and wxyz quaternion (N, 4)."""
     transform = view.get_transforms()
-    quat = transform[:, [6, 3, 4, 5]]
-    return transform[:, :3], quat, view.get_velocities(), view.get_coms()[:, :3]
+    return transform[:, :3], transform[:, [6, 3, 4, 5]]
 
 
 class TactileRecorder:
-    def __init__(self, env, output, calibration_root):
+    def __init__(self, env, output, calibration_root, mounted=False):
         from isaaclab.sensors import ContactSensor, ContactSensorCfg
         from isaacsim.core.simulation_manager import SimulationManager
         from isaacsim.core.utils.stage import get_current_stage
@@ -161,30 +165,38 @@ class TactileRecorder:
                 hull_points = np.concatenate([p for _, p in _collision_points(stage, path)])
                 normals, offsets = geo.hull_planes(hull_points)
                 self.fingers.append(dict(name=name, side=side, link=link, sign=sign, path=path,
-                                         sensor=sensor, hull=(normals, offsets), hull_points=hull_points))
+                                         sensor=sensor, hull=(normals, offsets), hull_points=hull_points,
+                                         inward=torch.tensor([0.0, sign, 0.0], device=self.device)))
 
-        self._build_taxel_grid()
-        self._build_gel(calibration_root, GelsightRender, GelSightRenderCfg)
+        rows, cols, pixel = GEL['rows'], GEL['cols'], GEL['mm_per_pixel'] / 1000
+        self.gel_u_range = (GEL['tip_u'] - rows * pixel, GEL['tip_u'])
+        self.gel_v_range = (GEL['v_center'] - cols * pixel / 2, GEL['v_center'] + cols * pixel / 2)
+        if mounted:
+            self.mounted = MountedGel([f['path'] for f in self.fingers], GEL, self.device, sim.sim.render)
+            gel = {**GEL, **MOUNT, 'kind': 'mounted'}
+            self.gel_mask = np.ones((len(self.fingers), rows, cols), bool)
+        else:
+            self.mounted = None
+            self._build_virtual_gel()
+            gel = {**GEL, **VIRTUAL, 'kind': 'virtual', 'coverage': self.gel_coverage}
+        cfg = GelSightRenderCfg(base_data_path=str(calibration_root), sensor_data_dir_name=GEL['calibration'],
+            background_path='bg.jpg', calib_path='polycalib.npz', real_background='real_bg.npy',
+            image_height=rows, image_width=cols, num_bins=120, mm_per_pixel=GEL['mm_per_pixel'])
+        self.gel_renderer = GelsightRender(cfg, device=self.device)
+        self.gel_nominal = _numpy(self.gel_renderer.render(torch.zeros(1, rows, cols, device=self.device))[0])
         self.rows, self.writer, self.closed = [], None, False
         self.meta = dict(schema='robodojo_tactile.v1', physics_dt=self.physics_dt, substeps=self.substeps,
             device=str(self.device), fingers=[dict(name=f['name'], side=f['side'], link=f['link'],
                 prim_path=f['path'], gripping_face_normal_local=[0.0, f['sign'], 0.0]) for f in self.fingers],
             blocks=dict(zip(self.block_labels, self.block_paths)), block_colliders=self.block_pieces,
-            taxel=dict(TAXEL, u_centres=self.taxel_u[:, 0].tolist(), v_centres=self.taxel_v[0].tolist()),
-            gel=dict(GEL, u_range=list(self.gel_u_range), v_range=list(self.gel_v_range),
-                     calibration_root=str(calibration_root), coverage=self.gel_coverage),
-            observation_only=True, init_seconds=time.monotonic()-started)
+            gel=dict(gel, u_range=list(self.gel_u_range), v_range=list(self.gel_v_range),
+                     calibration_root=str(calibration_root)),
+            observation_only=not mounted, init_seconds=time.monotonic()-started)
         (self.output/'meta.json').write_text(json.dumps(self.meta, indent=2))
 
     # ------------------------------------------------------------------ setup
-    def _build_taxel_grid(self):
-        self.taxel_u, self.taxel_v = geo.pad_grid(TAXEL['u_range'], TAXEL['v_range'],
-                                                  TAXEL['rows'], TAXEL['cols'])
-
-    def _build_gel(self, calibration_root, GelsightRender, GelSightRenderCfg):
+    def _build_virtual_gel(self):
         rows, cols, pixel = GEL['rows'], GEL['cols'], GEL['mm_per_pixel'] / 1000
-        self.gel_u_range = (GEL['tip_u'] - rows * pixel, GEL['tip_u'])
-        self.gel_v_range = (GEL['v_center'] - cols * pixel / 2, GEL['v_center'] + cols * pixel / 2)
         u, v = geo.pad_grid(self.gel_u_range, self.gel_v_range, rows, cols)
         self.gel_coverage = {}
         for finger in self.fingers:
@@ -206,21 +218,11 @@ class TactileRecorder:
             self.gel_coverage[finger['name']] = float(hit.mean())
             finger['gel_base'] = torch.as_tensor(base, dtype=torch.float32, device=self.device)  # (R, 3)
             finger['gel_mask'] = torch.as_tensor(hit, device=self.device)
-            finger['inward'] = torch.as_tensor(inward, dtype=torch.float32, device=self.device)
-            fr, fc = GEL['field']
-            step_r, step_c = rows // fr, cols // fc
-            index = (np.arange(fr)[:, None] * step_r + step_r // 2) * cols + (np.arange(fc)[None] * step_c + step_c // 2)
-            field_index = torch.as_tensor(index.reshape(-1), device=self.device)
-            finger['field_points'] = finger['gel_base'][field_index] + GEL['thickness'] * finger['inward']
-            finger['field_mask'] = finger['gel_mask'][field_index]  # no gel past the tapered tip
+        self.gel_mask = np.stack([_numpy(f['gel_mask'].reshape(rows, cols)) for f in self.fingers])
         self.gel_centre = torch.as_tensor([np.mean(self.gel_u_range), 0.0, GEL['v_center']],
                                           dtype=torch.float32, device=self.device)
-        self.gel_reach = float(np.hypot(rows * pixel, cols * pixel) / 2 + GEL['thickness'] + GEL['margin'] + 0.03)
-        cfg = GelSightRenderCfg(base_data_path=str(calibration_root), sensor_data_dir_name=GEL['calibration'],
-            background_path='bg.jpg', calib_path='polycalib.npz', real_background='real_bg.npy',
-            image_height=rows, image_width=cols, num_bins=120, mm_per_pixel=GEL['mm_per_pixel'])
-        self.gel_renderer = GelsightRender(cfg, device=self.device)
-        self.gel_nominal = _numpy(self.gel_renderer.render(torch.zeros(1, rows, cols, device=self.device))[0])
+        self.gel_reach = float(np.hypot(rows * pixel, cols * pixel) / 2 + VIRTUAL['thickness'] + VIRTUAL['margin']
+                               + 0.03)
 
     # ------------------------------------------------------------------ recording
     def record(self, step_id):
@@ -229,23 +231,17 @@ class TactileRecorder:
         block_state = [_pose(view) for view in self.block_views]
         block_pos = torch.cat([s[0] for s in block_state]).to(self.device)
         block_quat = torch.cat([s[1] for s in block_state]).to(self.device)
-        block_vel = torch.cat([s[2] for s in block_state]).to(self.device)
-        block_com = torch.cat([s[3] for s in block_state]).to(self.device)
-        row = dict(step=step_id, contact=[], taxel=[], gel_field_normal=[], gel_field_shear=[],
-                   gel_depth=[], finger_pose=[], block_pose=_numpy(torch.cat([block_pos, block_quat], -1)))
+        row = dict(step=step_id, contact=[], finger_pose=[],
+                   block_pose=_numpy(torch.cat([block_pos, block_quat], -1)))
         heights = []
-        for finger, (pos, quat, vel, com) in zip(self.fingers, finger_state):
-            pos, quat, vel, com = (x.to(self.device) for x in (pos, quat, vel, com))
+        for finger, (pos, quat) in zip(self.fingers, finger_state):
+            pos, quat = pos.to(self.device), quat.to(self.device)
             row['finger_pose'].append(_numpy(torch.cat([pos[0], quat[0]])))
             row['contact'].append(self._contact(finger, quat[0]))
-            row['taxel'].append(self._taxel(finger, pos[0], quat[0]))
-            height, normal, shear = self._gel(finger, pos[0], quat[0], vel[0], com[0],
-                                             block_pos, block_quat, block_vel, block_com)
-            heights.append(height)
-            row['gel_field_normal'].append(normal)
-            row['gel_field_shear'].append(shear)
-            row['gel_depth'].append(float(height.max()))
-        height = torch.stack(heights)
+            if self.mounted is None:
+                heights.append(self._virtual_gel(finger, pos[0], quat[0], block_pos, block_quat))
+        height = torch.stack(heights) if self.mounted is None else self.mounted.height()
+        row['gel_depth'] = _numpy(height.flatten(1).max(1).values).tolist()
         rgb = _numpy(self.gel_renderer.render(height))
         self._write_gel_frame(rgb)
         pooled = torch.nn.functional.max_pool2d(height[:, None], HEIGHT_POOL)[:, 0]
@@ -254,7 +250,7 @@ class TactileRecorder:
         self.rows.append(row)
 
     def _contact(self, finger, quat):
-        """Option 1: IsaacLab ContactSensor readings for one finger."""
+        """Contact sensor: IsaacLab ContactSensor readings for one finger."""
         data = finger['sensor'].data
         net = data.net_forces_w[0, 0]
         per_block = data.force_matrix_w[0, 0]                       # (B, 3) force on the finger
@@ -273,92 +269,24 @@ class TactileRecorder:
                     friction_w=_numpy(friction), contact_pos_w=_numpy(points),
                     normal=normal, shear_uv=np.array([float(shear @ u_axis), float(shear @ v_axis)]))
 
-    def _taxel(self, finger, pos, quat):
-        """Option 2: raw PhysX contact points of this finger vs each block, as pressure on its face."""
-        view = finger['sensor'].contact_physx_view
-        forces, points, _, _, count, start = view.get_contact_data(dt=self.physics_dt)
-        friction, friction_points, f_count, f_start = view.get_friction_data(dt=self.physics_dt)
-        count, start = count.reshape(-1).tolist(), start.reshape(-1).tolist()
-        f_count, f_start = f_count.reshape(-1).tolist(), f_start.reshape(-1).tolist()
-        sign = finger['sign']
-        pressure = np.zeros(self.taxel_u.shape)
-        shear = np.zeros((*self.taxel_u.shape, 2))
-        kept_points, kept_forces, contacts = [], [], 0
-        for block in range(len(self.block_paths)):
-            if count[block] == 0:
-                continue
-            rows = slice(start[block], start[block] + count[block])
-            local = _numpy(geo.quat_rotate_inverse(quat, points[rows].to(self.device) - pos))
-            magnitude = _numpy(forces[rows, 0])
-            contacts += len(local)
-            inner = sign * local[:, 1] > TAXEL['inner_y']
-            if not inner.any():
-                continue
-            patch = geo.patch_pressure(local[inner, 0], local[inner, 2], magnitude[inner],
-                                       self.taxel_u, self.taxel_v, TAXEL['sigma'])
-            pressure += patch
-            kept_points.append(local[inner][:, [0, 2]]); kept_forces.append(magnitude[inner])
-            if f_count[block] and patch.sum() > 0:
-                f_rows = slice(f_start[block], f_start[block] + f_count[block])
-                f_local = _numpy(geo.quat_rotate_inverse(quat, friction[f_rows].to(self.device)))
-                f_side = sign * _numpy(geo.quat_rotate_inverse(quat, friction_points[f_rows].to(self.device) - pos))[:, 1]
-                total = f_local[f_side > TAXEL['inner_y']][:, [0, 2]].sum(0)
-                shear += patch[..., None] / patch.sum() * total  # patch's friction, spread like its pressure
-        points_uv = np.concatenate(kept_points) if kept_points else np.zeros((0, 2))
-        point_force = np.concatenate(kept_forces) if kept_forces else np.zeros(0)
-        return dict(pressure=pressure.astype(np.float32), shear=shear.astype(np.float32),
-                    contacts=contacts, inner_contacts=len(points_uv),
-                    points_uv=points_uv.astype(np.float32), point_force=point_force.astype(np.float32))
-
-    def _gel(self, finger, pos, quat, vel, com, block_pos, block_quat, block_vel, block_com):
-        """Option 3: virtual-gel indentation (GelSight image input) and the TacSL force field."""
+    def _virtual_gel(self, finger, pos, quat, block_pos, block_quat):
+        """GelSight: virtual-gel indentation, the input to TacSL's GelSight image renderer."""
         rows, cols = GEL['rows'], GEL['cols']
-        thickness, margin = GEL['thickness'], GEL['margin']
+        thickness, margin = VIRTUAL['thickness'], VIRTUAL['margin']
+        height = torch.zeros(rows * cols, device=self.device)
         centre = geo.quat_rotate(quat, self.gel_centre) + pos
         near = geo.near_pieces(self.blocks_convex, block_pos, centre, self.gel_reach)
-        field_count = GEL['field'][0] * GEL['field'][1]
-        height = torch.zeros(rows * cols, device=self.device)
-        normal_force = torch.zeros(field_count, device=self.device)
-        shear_force = torch.zeros(field_count, 2, device=self.device)
         if len(near):
             convex = geo.subset(self.blocks_convex, near)
-            inward_w = geo.quat_rotate(quat, finger['inward'])
-            # Height map: rays from `margin` inside the finger surface outward along the gel normal.
+            # Rays from `margin` inside the finger surface outward along the gel normal.
             origins = geo.quat_rotate(quat, finger['gel_base'] - margin * finger['inward']) + pos
-            directions = inward_w.expand_as(origins)
+            directions = geo.quat_rotate(quat, finger['inward']).expand_as(origins)
             local_o, local_d = geo.to_piece_frames(convex, block_pos, block_quat, origins, directions)
             t, _ = geo.ray_entry(convex.normals, convex.offsets, local_o, local_d)
             gap = t.min(0).values - margin       # distance from the finger surface to the object
             height = torch.where(torch.isfinite(gap) & finger['gel_mask'],
                                  (thickness - gap).clamp(0, thickness + margin), height)
-            # Force field (TacSL penalty model) at the undeformed gel surface points.
-            points_w = geo.quat_rotate(quat, finger['field_points']) + pos
-            local_p = geo.to_piece_frames(convex, block_pos, block_quat, points_w)
-            sdf, grad = geo.convex_sdf(convex.normals, convex.offsets, local_p)
-            depth, piece = (-sdf).clamp(min=0).max(0)
-            depth = torch.where(finger['field_mask'], depth, torch.zeros_like(depth))
-            if bool((depth > 0).any()):
-                body = convex.body[piece]
-                pts = torch.arange(len(piece), device=self.device)
-                normal_w = geo.quat_rotate(block_quat[body], grad[piece, pts])
-                fc = GEL['k_n'] * depth
-                point_vel = vel[:3] + torch.cross(vel[3:].expand_as(points_w),
-                                                  points_w - (geo.quat_rotate(quat, com) + pos), dim=-1)
-                block_com_w = geo.quat_rotate(block_quat[body], block_com[body]) + block_pos[body]
-                object_vel = block_vel[body, :3] + torch.cross(block_vel[body, 3:], points_w - block_com_w, dim=-1)
-                relative = point_vel - object_vel
-                vt = relative - normal_w * (normal_w * relative).sum(-1, keepdim=True)
-                vt_norm = vt.norm(dim=-1)
-                ft = torch.minimum(GEL['k_t'] * vt_norm, GEL['mu'] * fc)
-                force_w = fc[:, None] * normal_w - ft[:, None] * vt / vt_norm.clamp(min=1e-9)[:, None]
-                force_w = torch.where((depth > 0)[:, None], force_w, torch.zeros_like(force_w))
-                u_axis = geo.quat_rotate(quat, torch.tensor([1.0, 0, 0], device=self.device))
-                v_axis = geo.quat_rotate(quat, torch.tensor([0, 0, 1.0], device=self.device))
-                normal_force = force_w @ (-inward_w)
-                shear_force = torch.stack([force_w @ u_axis, force_w @ v_axis], -1)
-        fr, fc_ = GEL['field']
-        return (height.reshape(rows, cols), _numpy(normal_force.reshape(fr, fc_)),
-                _numpy(shear_force.reshape(fr, fc_, 2)))
+        return height.reshape(rows, cols)
 
     def _write_gel_frame(self, rgb):
         if self.writer is None:
@@ -379,13 +307,6 @@ class TactileRecorder:
             return
         stack = lambda key: np.stack([np.stack(r[key]) if isinstance(r[key], list) else r[key] for r in self.rows])
         contact = lambda key: np.stack([[c[key] for c in r['contact']] for r in self.rows])
-        taxel = lambda key: np.stack([[t[key] for t in r['taxel']] for r in self.rows])
-        points = [[t['points_uv'] for t in r['taxel']] for r in self.rows]
-        forces = [[t['point_force'] for t in r['taxel']] for r in self.rows]
-        flat_points, flat_forces, offsets = [], [], [0]
-        for step_points, step_forces in zip(points, forces):
-            for p, f in zip(step_points, step_forces):
-                flat_points.append(p); flat_forces.append(f); offsets.append(offsets[-1] + len(p))
         np.savez_compressed(self.output/'tactile.npz',
             step=np.array([r['step'] for r in self.rows]), seconds=np.array([r['seconds'] for r in self.rows]),
             finger_pose=stack('finger_pose'), block_pose=stack('block_pose'),
@@ -393,14 +314,7 @@ class TactileRecorder:
             contact_block_force_w=contact('block_force_w'), contact_block_peak=contact('block_peak'),
             contact_friction_w=contact('friction_w'), contact_pos_w=contact('contact_pos_w'),
             contact_normal=contact('normal'), contact_shear_uv=contact('shear_uv'),
-            taxel_pressure=taxel('pressure'), taxel_shear=taxel('shear'),
-            taxel_contacts=taxel('contacts'), taxel_inner_contacts=taxel('inner_contacts'),
-            taxel_points_uv=np.concatenate(flat_points) if flat_points else np.zeros((0, 2), np.float32),
-            taxel_point_force=np.concatenate(flat_forces) if flat_forces else np.zeros(0, np.float32),
-            taxel_point_offsets=np.array(offsets),
             gel_height=stack('gel_height'), gel_depth=np.array([r['gel_depth'] for r in self.rows]),
-            gel_field_normal=stack('gel_field_normal'), gel_field_shear=stack('gel_field_shear'),
-            gel_nominal=self.gel_nominal,
-            gel_mask=np.stack([_numpy(f['gel_mask'].reshape(GEL['rows'], GEL['cols'])) for f in self.fingers]))
+            gel_nominal=self.gel_nominal, gel_mask=self.gel_mask)
         self.meta.update(frames=len(self.rows), mean_record_seconds=float(np.mean([r['seconds'] for r in self.rows])))
         (self.output/'meta.json').write_text(json.dumps(self.meta, indent=2))

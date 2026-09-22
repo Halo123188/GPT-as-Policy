@@ -1,8 +1,8 @@
-"""Tactile sensing on the dual ARX X5 grippers (observation-only; never changes physics).
+"""Tactile sensing on the dual ARX X5 grippers.
 
-Three sensor models share one rollout:
+Every rollout records two sensor models:
   contact  - IsaacLab ContactSensor per finger link, filtered against every task block.
-  taxel    - the same PhysX contact points binned into a pressure/shear grid on each finger face.
-  gelsight - TacSL-style GelSight: a virtual gel on each fingertip, its indentation rendered with
-             IsaacLab's TacSL GelSight renderer, plus TacSL's penalty normal/shear force field.
+  gelsight - a TacSL GelSight image per fingertip (the image only, as a real sensor gives), from either
+             a virtual 1 mm gel ray-cast against the blocks (observation-only; physics unchanged) or,
+             with ``mounted``, a compliant gel pad imaged by a depth camera (changes the fingertip contact).
 """

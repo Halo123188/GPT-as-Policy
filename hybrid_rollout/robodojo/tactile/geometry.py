@@ -1,9 +1,9 @@
-"""Simulator-free geometry for the tactile models: convex pieces, ray casts, SDFs and grids.
+"""Simulator-free geometry for the tactile models: convex pieces, ray casts and grids.
 
 Every contact body in build_tower (the blocks and the X5 finger collision hulls) is convex, so a
-piece is stored as half-spaces ``normals @ p <= offsets`` in its rigid-body frame. That gives an
-exact inside distance (for TacSL's penetration depth) and exact ray entry points (for the gel
-height map) on CPU or GPU, for any number of objects, without PhysX SDF meshes.
+piece is stored as half-spaces ``normals @ p <= offsets`` in its rigid-body frame. That gives
+exact ray entry points (for the gel height map) on CPU or GPU, for any number of objects,
+without PhysX SDF meshes.
 """
 from dataclasses import dataclass
 
@@ -89,17 +89,6 @@ def ray_entry(normals, offsets, origins, directions):
     return torch.where(hit, t_enter, torch.full_like(t_enter, torch.inf)), entry_normal
 
 
-def convex_sdf(normals, offsets, points):
-    """Signed distance of (P, R, 3) points to each convex piece: exact inside, a lower bound outside.
-
-    Returns (sdf (P, R), gradient (P, R, 3) in the piece frame).
-    """
-    signed = torch.einsum('pfk,prk->prf', normals, points) - offsets[:, None, :]
-    sdf, face = signed.max(-1)
-    grad = torch.gather(normals, 1, face[..., None].expand(-1, -1, 3))
-    return sdf, grad
-
-
 def to_piece_frames(convex, body_pos, body_quat, points, directions=None):
     """Express world (R, 3) points/directions in every piece frame -> (P, R, 3)."""
     pos, quat = body_pos[convex.body], body_quat[convex.body]
@@ -126,55 +115,3 @@ def pad_grid(u_range, v_range, rows, cols):
     u = (u_edges[:-1] + u_edges[1:]) / 2
     v = (v_edges[:-1] + v_edges[1:]) / 2
     return np.meshgrid(u, v, indexing='ij')
-
-
-def splat(u, v, values, u_centres, v_centres, sigma):
-    """Spread point values (N,) or (N, C) onto a grid with a normalised Gaussian kernel.
-
-    The kernel integrates to one over the plane, so the grid sum equals the point sum for points
-    well inside the grid. Returns (rows, cols) or (rows, cols, C).
-    """
-    values = np.asarray(values, np.float64)
-    squeeze = values.ndim == 1
-    values = values[:, None] if squeeze else values
-    rows, cols = u_centres.shape
-    out = np.zeros((rows, cols, values.shape[1]))
-    if len(values):
-        cell = abs(u_centres[0, 0] - u_centres[min(1, rows - 1), 0]) or 1.0
-        cell_v = abs(v_centres[0, min(1, cols - 1)] - v_centres[0, 0]) or 1.0
-        du = u_centres[None] - np.asarray(u)[:, None, None]
-        dv = v_centres[None] - np.asarray(v)[:, None, None]
-        kernel = np.exp(-(du ** 2 + dv ** 2) / (2 * sigma ** 2)) * cell * cell_v / (2 * np.pi * sigma ** 2)
-        out = np.einsum('nrc,nk->rck', kernel, values)
-    return out[..., 0] if squeeze else out
-
-
-def patch_pressure(u, v, forces, u_centres, v_centres, sigma):
-    """Pressure grid for one finger-object contact patch from its PhysX manifold points.
-
-    PhysX reports a flat face-on-face contact by the corners of the patch polygon, each with its
-    share of the force. Inside that polygon the pressure is interpolated linearly between the
-    corner forces (so a tilted grasp shows a pressure gradient), rescaled to the patch's total
-    force. Point, edge or sub-cell patches fall back to the Gaussian splat. Returns (rows, cols).
-    """
-    points, forces = np.c_[u, v], np.asarray(forces, np.float64)
-    total = forces.sum()
-    if total <= 0:
-        return np.zeros(u_centres.shape)
-    if len(points) >= 3:
-        from scipy.interpolate import LinearNDInterpolator
-        from scipy.spatial import Delaunay, QhullError
-        try:
-            triangulation = Delaunay(points)
-        except QhullError:  # collinear: an edge contact
-            triangulation = None
-        if triangulation is not None:
-            cells = np.c_[u_centres.ravel(), v_centres.ravel()]
-            inside = triangulation.find_simplex(cells) >= 0
-            if inside.any():
-                values = np.clip(np.nan_to_num(LinearNDInterpolator(triangulation, forces)(cells[inside])), 0, None)
-                if values.sum() > 0:
-                    grid = np.zeros(cells.shape[0])
-                    grid[inside] = values * total / values.sum()
-                    return grid.reshape(u_centres.shape)
-    return splat(u, v, forces, u_centres, v_centres, sigma)

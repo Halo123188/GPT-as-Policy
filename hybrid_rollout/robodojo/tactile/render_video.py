@@ -1,7 +1,7 @@
 """Side-by-side videos: rollout cameras (left) and one tactile model over time (right).
 
 Runs without Isaac Sim, from a finished archive (``<archive>/sim/sensors.mp4`` and
-``<archive>/sim/tactile/``). Writes ``contact.mp4``, ``taxel.mp4`` and ``gelsight.mp4``.
+``<archive>/sim/tactile/``). Writes ``contact.mp4`` and ``gelsight.mp4`` (virtual gel) or ``gelsight_real.mp4`` (mounted gel).
 """
 import argparse
 import json
@@ -12,8 +12,6 @@ import numpy as np
 # Dark chart theme (reference palette, dark mode) and categorical slots 1-4 for the four fingers.
 SURFACE, INK, INK_2, MUTED, GRID, AXIS = '#1a1a19', '#ffffff', '#c3c2b7', '#898781', '#2c2c2a', '#383835'
 SERIES = ('#3987e5', '#d95926', '#199e70', '#c98500')
-SEQUENTIAL = ('#1a1a19', '#104281', '#1c5cab', '#3987e5', '#86b6ef', '#cde2fb')        # force (blue)
-SEQUENTIAL_2 = ('#1a1a19', '#5a2a14', '#9a3f1c', '#d95926', '#eb8a5f', '#f6c3a8')      # indentation (orange)
 PANEL = (960, 810)          # right panel, px
 LEFT_W = 960                # left column: head camera 960x540 over two wrist cameras 480x270
 # Effective finger-block friction coefficient: in every demo episode the per-block friction/normal
@@ -178,18 +176,11 @@ def clock(text, t, k):
     text.set_text(f't = {t[k]:5.2f} s')
 
 
-def sequential_cmap(ramp=SEQUENTIAL):
-    from matplotlib.colors import LinearSegmentedColormap
-    cmap = LinearSegmentedColormap.from_list('seq', ramp)
-    cmap.set_bad(SURFACE)
-    return cmap
-
-
-# ---------------------------------------------------------------------------- option 1
+# ---------------------------------------------------------------------------- contact sensor
 def contact_panel(meta, data, t):
     fig, plt = figure()
     names = [f['name'] for f in meta['fingers']]
-    now = header(fig, 'Option 1 · Contact sensor',
+    now = header(fig, 'Contact sensor',
                  'IsaacLab ContactSensor on each finger link, filtered against the 8 blocks (PhysX contact forces)')
     # The sensor covers the whole link: side or back hits have no gripping-face component but still
     # carry normal and friction force, so plot magnitudes over all faces.
@@ -236,135 +227,54 @@ def contact_panel(meta, data, t):
     return update, fig
 
 
-# ---------------------------------------------------------------------------- option 2
-def taxel_panel(meta, data, t):
-    fig, plt = figure()
-    names = [f['name'] for f in meta['fingers']]
-    tax = meta['taxel']
-    u = np.array(tax['u_centres']) * 1000; v = np.array(tax['v_centres']) * 1000
-    du, dv = abs(u[0] - u[1]), abs(v[1] - v[0])
-    now = header(fig, 'Option 2 · Taxel grid',
-                 f"PhysX contact patches, distal {u[0]-u[-1]+du:.0f} mm of each finger face "
-                 f"({tax['rows']}×{tax['cols']} taxels, {du:.1f}×{dv:.1f} mm) · dots = contacts · arrows = friction")
-    pressure, shear = data['taxel_pressure'], data['taxel_shear']
-    active = pressure[pressure > 0]
-    vmax = max(float(np.percentile(active, 99)) if active.size else 1.0, 1e-3)
-    extent = (v[0] - dv / 2, v[-1] + dv / 2, u[-1] - du / 2, u[0] + du / 2)
-    grid = fig.add_gridspec(2, 1, left=0.07, right=0.95, top=0.95, bottom=0.07, hspace=0.22, height_ratios=[1.45, 1])
-    maps = grid[0].subgridspec(1, 5, width_ratios=[1, 1, 1, 1, 0.07], wspace=0.28)
-    cmap = sequential_cmap()
-    images, arrows, dots = [], [], []
-    V, U = np.meshgrid(v, u)
-    norms = np.linalg.norm(shear, axis=-1)[pressure > 0.05 * vmax]
-    shear_scale = max(float(np.percentile(norms, 99)) if norms.size else 1e-3, 1e-4)
-    for i, name in enumerate(names):
-        ax = fig.add_subplot(maps[0, i])
-        image_axes(ax, finger_label(name))
-        images.append(ax.imshow(pressure[0, i], cmap=cmap, vmin=0, vmax=vmax, extent=extent,
-                                origin='upper', interpolation='nearest', aspect='equal'))
-        arrows.append(ax.quiver(V, U, np.zeros_like(V), np.zeros_like(U), color=INK, angles='xy',
-                                scale_units='xy', scale=shear_scale / (2.5 * du), width=0.014, headwidth=3.5))
-        dots.append(ax.plot([], [], 'o', color=SERIES[i], markersize=4, markeredgecolor=INK, markeredgewidth=0.6)[0])
-        ax.plot([extent[0], extent[1]], [extent[3], extent[3]], color=SERIES[i], linewidth=4, clip_on=False)
-        ax.set_xlabel('width (mm)', color=MUTED, fontsize=7); ax.set_xticks([-20, 0, 20])
-        ax.set_yticks([30, 50, 70]); ax.tick_params(colors=MUTED, labelsize=7)
-        if i == 0:
-            ax.set_ylabel('from finger root (mm) · tip at top', color=MUTED, fontsize=7)
-        else:
-            ax.set_yticklabels([])
-    cax = fig.add_subplot(maps[0, 4])
-    bar = fig.colorbar(images[0], cax=cax, extend='max')
-    bar.set_label('normal force per taxel (N)', color=INK_2, fontsize=8)
-    bar.ax.tick_params(colors=MUTED, labelsize=7); bar.outline.set_edgecolor(AXIS)
-    total = pressure.sum(axis=(2, 3))
-    series = TimeSeries(fig.add_subplot(grid[1]), t, total, names, 'N', 'Total normal force on the taxels')
-    offsets = data['taxel_point_offsets']; pts = data['taxel_points_uv'] * 1000
-
-    def update(k):
-        clock(now, t, k)
-        for i in range(len(names)):
-            images[i].set_data(pressure[k, i])
-            quiet = pressure[k, i] < 0.05 * vmax
-            arrows[i].set_UVC(np.ma.masked_where(quiet, shear[k, i, ..., 1]),
-                              np.ma.masked_where(quiet, shear[k, i, ..., 0]))
-            j = k * len(names) + i
-            p = pts[offsets[j]:offsets[j + 1]]
-            dots[i].set_data(p[:, 1], p[:, 0])
-        series.update(k)
-        return canvas_rgb(fig)
-    return update, fig
+# ---------------------------------------------------------------------------- GelSight and GelSight real
+IMAGE_CHANGE = 8            # |ΔRGB| above this counts as a changed pixel (video noise stays below ~6)
 
 
-# ---------------------------------------------------------------------------- option 3
-def pool_mask(mask, factor):
-    n, h, w = mask.shape
-    return mask[:, :h // factor * factor, :w // factor * factor].reshape(n, h // factor, factor, w // factor, factor).all((2, 4))
+def gel_tiles(frame, gel, fingers):
+    return np.split(frame[:gel['rows'], :gel['cols'] * fingers], fingers, axis=1)
 
 
-def gelsight_panel(meta, data, t, gel_frames):
+def gel_image_change(frames, nominal, gel, fingers):
+    """Share of each finger's image that differs from the no-contact image: what a real sensor gives."""
+    nominal = nominal.astype(np.int16)
+    return np.array([[(np.abs(tile.astype(np.int16) - nominal).max(-1) > IMAGE_CHANGE).mean() * 100
+                      for tile in gel_tiles(frame, gel, fingers)] for frame in frames])
+
+
+def gelsight_panel(meta, data, t, gel_frames, change):
     fig, plt = figure()
     names = [f['name'] for f in meta['fingers']]
     gel = meta['gel']
-    now = header(fig, 'Option 3 · TacSL GelSight',
-                 f"Virtual {gel['thickness']*1000:.0f} mm gel on each fingertip ({gel['rows']*gel['mm_per_pixel']:.0f}×"
-                 f"{gel['cols']*gel['mm_per_pixel']:.0f} mm): TacSL R1.5 image, indentation, TacSL force field")
-    fr, fc = gel['field']
-    mask = data['gel_mask']
-    step_r, step_c = mask.shape[1] // fr, mask.shape[2] // fc
-    field_mask = mask[:, step_r // 2::step_r, step_c // 2::step_c][:, :fr, :fc]  # gel present at each point
-    field_n = data['gel_field_normal'] * field_mask[None]
-    field_s = data['gel_field_shear'] * field_mask[None, ..., None]
-    height = data['gel_height'].astype(np.float32) * 1000        # mm, 4x4 max-pooled
-    pooled = pool_mask(mask, mask.shape[1] // height.shape[2])
-    height = np.where(pooled[None], height, np.nan)
-    depth_max = max(float(np.nanpercentile(height[height > 0], 99)) if (height > 0).any() else 1.0, 0.05)
-    vmax = max(float(np.percentile(field_n[field_n > 0], 99.5)) if (field_n > 0).any() else 0.1, 1e-4)
-    norms = np.linalg.norm(field_s, axis=-1)[field_n > 0]
-    shear_scale = max(float(np.percentile(norms, 99)) if norms.size else 1e-4, 1e-5)
-    grid = fig.add_gridspec(2, 1, left=0.03, right=0.95, top=0.855, bottom=0.07, hspace=0.25, height_ratios=[2.5, 1])
-    cells = grid[0].subgridspec(2, 8, width_ratios=[1, 1, 1, 0.12, 1, 1, 1, 0.09], wspace=0.06, hspace=0.20)
-    depth_cmap, force_cmap = sequential_cmap(SEQUENTIAL_2), sequential_cmap()
-    rgb_images, depths, fields, arrows = [], [], [], []
-    X, Y = np.meshgrid(np.arange(fc), np.arange(fr))
+    size = f"{gel['rows']*gel['mm_per_pixel']:.0f}×{gel['cols']*gel['mm_per_pixel']:.0f} mm"
+    if gel.get('kind') == 'mounted':
+        now = header(fig, 'GelSight real',
+                     f"Compliant {gel['thickness']*1000:.0f} mm gel pad on each fingertip ({size}), imaged by a depth camera "
+                     "behind it and rendered with the TacSL R1.5 model")
+        note = 'Image change from the no-contact image · the harder the grip, the deeper the imprint'
+    else:
+        now = header(fig, 'GelSight',
+                     f"Virtual {gel['thickness']*1000:.0f} mm gel on each fingertip ({size}), rendered with the TacSL R1.5 "
+                     "model: the image a real sensor gives")
+        note = 'Image change from the no-contact image · rigid fingers press flat, so mostly contact edges show'
+    grid = fig.add_gridspec(2, 1, left=0.03, right=0.97, top=0.87, bottom=0.07, hspace=0.2, height_ratios=[1.25, 1])
+    cells = grid[0].subgridspec(1, 5, width_ratios=[1, 1, 0.12, 1, 1], wspace=0.05)
+    images = []
     for i, name in enumerate(names):
-        r, c = divmod(i, 2)
-        col = c * 4
-        ax = fig.add_subplot(cells[r, col])
-        image_axes(ax, 'TacSL image')
-        ax.text(0.0, 1.16, finger_label(name), transform=ax.transAxes, color=INK, fontsize=9, fontweight='bold')
-        rgb_images.append(ax.imshow(np.zeros((gel['rows'], gel['cols'], 3), np.uint8), aspect='equal'))
+        ax = fig.add_subplot(cells[0, i + i // 2])
+        image_axes(ax, finger_label(name))
+        images.append(ax.imshow(np.zeros((gel['rows'], gel['cols'], 3), np.uint8), aspect='equal'))
         ax.plot([0, gel['cols'] - 1], [0, 0], color=SERIES[i], linewidth=4, clip_on=False)
-        ax = fig.add_subplot(cells[r, col + 1])
-        image_axes(ax, 'indentation')
-        depths.append(ax.imshow(height[0, i], cmap=depth_cmap, vmin=0, vmax=depth_max, aspect='equal',
-                                interpolation='nearest'))
-        ax = fig.add_subplot(cells[r, col + 2])
-        image_axes(ax, 'force field')
-        fields.append(ax.imshow(field_n[0, i], cmap=force_cmap, vmin=0, vmax=vmax, aspect='equal', interpolation='nearest'))
-        arrows.append(ax.quiver(X, Y, np.zeros_like(X, float), np.zeros_like(Y, float), color=INK, angles='xy',
-                                scale_units='xy', scale=shear_scale / 1.5, width=0.02, headwidth=3.5))
-    bars = cells[:, 7].subgridspec(2, 1, hspace=0.35)
-    for index, (image, label) in enumerate(((depths[0], 'indentation (mm)'), (fields[0], 'normal force per point (N)'))):
-        bar = fig.colorbar(image, cax=fig.add_subplot(bars[index]))
-        bar.set_label(label, color=INK_2, fontsize=8)
-        bar.ax.tick_params(colors=MUTED, labelsize=7); bar.outline.set_edgecolor(AXIS)
-    total = np.clip(field_n, 0, None).sum(axis=(2, 3))
-    series = TimeSeries(fig.add_subplot(grid[1]), t, total, names, 'N',
-                        'TacSL force-field total · tracks contact area (rigid fingers fill the 1 mm gel)')
-    dim = np.where(mask[..., None], 1.0, 0.25)
+    ax = fig.add_subplot(grid[1])
+    box = ax.get_position()
+    ax.set_position([0.09, box.y0, 0.95 - 0.09, box.height])  # room for the y ticks, as in the other panels
+    series = TimeSeries(ax, t, change[:len(t)], names, '% of pixels',
+                        note, fmt='{:.0f}')
 
     def update(k):
         clock(now, t, k)
-        frame = next(gel_frames)
-        tiles = np.split(frame[:gel['rows'], :gel['cols'] * len(names)], len(names), axis=1)
-        for i in range(len(names)):
-            rgb_images[i].set_data((tiles[i] * dim[i]).astype(np.uint8))
-            depths[i].set_data(height[k, i])
-            fields[i].set_data(field_n[k, i])
-            quiet = field_n[k, i] <= 0
-            # Field rows run tip -> root like the image; image x = width (v), y = length (u).
-            arrows[i].set_UVC(np.ma.masked_where(quiet, field_s[k, i, ..., 1]),
-                              np.ma.masked_where(quiet, -field_s[k, i, ..., 0]))
+        for image, tile in zip(images, gel_tiles(next(gel_frames), gel, len(names))):
+            image.set_data(tile)
         series.update(k)
         return canvas_rgb(fig)
     return update, fig
@@ -378,24 +288,28 @@ def gel_frame_iter(path):
     reader.close()
 
 
-def render(archive, output, models=('contact', 'taxel', 'gelsight'), limit=None):
+def render(archive, output, models=None, limit=None):
     import imageio.v2 as imageio
     sim, meta, data = load(archive)
+    gel_model = 'gelsight_real' if meta['gel'].get('kind') == 'mounted' else 'gelsight'
+    models = models or ['contact', gel_model]
+    if {'gelsight', 'gelsight_real'} & set(models) - {gel_model}:
+        raise ValueError(f'{archive} records {gel_model}, not {models}')
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     dt = json.loads((sim/'reset.json').read_text())['metadata']['control_dt'] if (sim/'reset.json').exists() else 0.04
     total = len(data['step'])
     steps = total if limit is None else min(limit, total)
-    if steps < total:  # Preview: every per-frame array, including the flattened contact-point index.
-        fingers = len(meta['fingers'])
+    if steps < total:  # Preview: truncate every per-frame array.
         data = {key: value[:steps] if value.ndim and len(value) == total else value for key, value in data.items()}
-        data['taxel_point_offsets'] = data['taxel_point_offsets'][:steps * fingers + 1]
     t = data['step'] * dt
     written = []
     for model in models:
-        if model == 'gelsight':
-            update, fig = gelsight_panel(meta, data, t, gel_frame_iter(sim/'tactile'/'gelsight.mp4'))
+        if model == gel_model:
+            video = sim/'tactile'/'gelsight.mp4'
+            change = gel_image_change(gel_frame_iter(video), data['gel_nominal'], meta['gel'], len(meta['fingers']))
+            update, fig = gelsight_panel(meta, data, t, gel_frame_iter(video), change)
         else:
-            update, fig = (contact_panel if model == 'contact' else taxel_panel)(meta, data, t)
+            update, fig = contact_panel(meta, data, t)
         path = output/f'{model}.mp4'
         writer = imageio.get_writer(str(path), fps=round(1 / dt), codec='libx264', pixelformat='yuv420p',
                                     quality=None, macro_block_size=2, output_params=['-crf', '18', '-movflags', '+faststart'])
@@ -419,7 +333,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--archive', type=Path, required=True, help='results/<experiment>/<case>/attempt_N')
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--models', nargs='+', default=['contact', 'taxel', 'gelsight'])
+    parser.add_argument('--models', nargs='+', choices=['contact', 'gelsight', 'gelsight_real'],
+                        help='Default: contact and the archive\'s GelSight model')
     parser.add_argument('--limit', type=int, help='Render only the first N frames (preview)')
     args = parser.parse_args()
     render(args.archive, args.output, args.models, args.limit)
