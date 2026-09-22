@@ -36,8 +36,9 @@ def register_native_evaluation(env):
 
 
 class RoboDojoSession:
-    def __init__(self, env, output, task, evaluation_identity=None):
+    def __init__(self, env, output, task, evaluation_identity=None, tactile_factory=None):
         self.env, self.output = env, Path(output)
+        self.tactile_factory, self.tactile = tactile_factory, None
         self.output.mkdir(parents=True, exist_ok=True)
         self.episode_id, self.step_id = None, 0
         self.terminated = self.truncated = self.success = False
@@ -90,6 +91,8 @@ class RoboDojoSession:
             frames = [np.asarray(Image.fromarray(images[k]).resize((640, 360))) for k in CAMERAS]
             self.video_writer.append_data(np.concatenate(frames, axis=1))
             self.video_frames += 1
+            if self.tactile is not None:
+                self.tactile.record(self.step_id)  # One tactile frame per recorded video frame.
         return self.obs
 
     def reset(self, seed, source, policy_version):
@@ -116,6 +119,9 @@ class RoboDojoSession:
         self.episode_dir.mkdir()
         self.poisoned = False
         self.kinematics = DualKinematics(self.env)
+        if self.tactile_factory is not None:
+            # Blocks are re-spawned by the native reset, so sensors attach only after it.
+            self.tactile = self.tactile_factory(self.env, self.output)
         write_json(self.output/'fk_validation.json', self.kinematics.check())
         self._observe(record=True)
         fingerprints = {}
@@ -173,6 +179,8 @@ class RoboDojoSession:
             return
         if self.video_writer is not None:
             self.video_writer.close(); self.video_writer = None
+        if self.tactile is not None:
+            self.tactile.close()
         if self.finish_reason is not None:
             reason = self.finish_reason  # Do not overwrite a budget/error outcome during server cleanup.
         complete = self.terminated or self.truncated

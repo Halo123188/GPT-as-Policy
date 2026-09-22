@@ -75,6 +75,16 @@ python -m hybrid_rollout.robodojo.pi05_only_summary --results "$RUNTIME_ROOT/res
 
 The summary compares the per-task score and success rate with the leaderboard π₀.₅ and the report's hybrid and Direct results. `robodojo_server/runtime.sh` uses the host's installed NVIDIA Vulkan/EGL driver libraries when no private graphics runtime is provided.
 
+### Optional tactile sensing on the X5 grippers
+
+Set `ROBODOJO_TACTILE=1` and `ROBODOJO_TACTILE_CALIBRATION=<dir containing gelsight_r15_data/>` for any launch above. The simulator then records three observation-only tactile models on all four fingers, one frame per control step, into `sim/tactile/`. Contact reporting is enabled on the robot links; no collision, material or solver setting changes.
+
+- **contact**: an IsaacLab `ContactSensor` per finger link, filtered against every task block. It records per-block normal force (IsaacLab's force matrices are normal-only), PhysX friction, and the peak over the physics substeps. The video plots both magnitudes and their ratio against the effective friction coefficient (0.5 in these runs): a finger slides when the ratio reaches it.
+- **taxel**: the same PhysX contact points, rebuilt as pressure patches and friction on a 24×20 grid over each finger face.
+- **gelsight**: a virtual 1 mm gel on each fingertip. Its indentation is ray-cast against the block colliders, rendered with IsaacLab's TacSL GelSight renderer, and converted to TacSL's penalty normal/shear force field. The fingers are rigid, so the field reports contact shape and area; grip force comes from the contact model.
+
+The GelSight R1.5 calibration (`bg.jpg`, `polycalib.npz`) is published under `Assets/Isaac/5.1/Isaac/IsaacLab/TacSL/gelsight_r15_data/` in NVIDIA's Isaac asset bucket. To render side-by-side videos (cameras on the left, one tactile model on the right, with time plots scrolling over the last 5 s), run `python -m hybrid_rollout.robodojo.tactile.render_video --archive <attempt dir> --output <dir>` from the simulator environment.
+
 The model is fixed to `gpt-6-astra` with `xhigh` reasoning. No provider fallback is implied. You need your own authorized account or gateway access. Policy/model execution can incur costs. Read the skills and action contract before launching; no simulation or model calls are made by the preview or offline tests.
 
 ### Deployment and security boundaries

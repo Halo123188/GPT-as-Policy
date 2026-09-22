@@ -87,6 +87,13 @@ def main():
         # EEF corrections use bounded robot-only DLS, never object-aware cuRobo.
         for robot in cfg.robot.robots:
             robot.need_planner = False
+        tactile_factory = None
+        if os.environ.get('ROBODOJO_TACTILE') == '1':
+            # Observation-only tactile sensing; contact reporting must exist before the robot spawns.
+            from functools import partial
+            from ..tactile.recorder import TactileRecorder, enable_contact_reporting
+            enable_contact_reporting()
+            tactile_factory = partial(TactileRecorder, calibration_root=os.environ['ROBODOJO_TACTILE_CALIBRATION'])
         original = eval_env.WsModelClient
         try:
             eval_env.WsModelClient = NoPolicyConnection
@@ -100,7 +107,7 @@ def main():
         from ..io import write_json
         write_json(args.output/'resolved_config.json', OmegaConf.to_container(cfg, resolve=True))
         session = RoboDojoSession(env, args.output, args.task,
-            evaluation_identity=selected['identity'] if evaluation_case else None)
+            evaluation_identity=selected['identity'] if evaluation_case else None, tactile_factory=tactile_factory)
         serve(session, args.port)
     except BaseException:
         # SimulationApp.close may exit before Python prints an uncaught error.
