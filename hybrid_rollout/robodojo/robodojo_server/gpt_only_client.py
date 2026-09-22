@@ -5,7 +5,6 @@ import numpy as np
 
 from ..io import InputError, write_json
 from ..prompt_context import CONTEXT_VERSION
-from ..settings import MODEL, EFFORT, PROVIDER
 from .client import RoboDojoTools, ARMS
 from .decision_log import decision_event, emit
 from .validation import validate_response, validate_public_language
@@ -74,13 +73,16 @@ class GPTOnlyTools(RoboDojoTools):
             self.meta['instruction'] = reset['instruction']
         self.episode, self.tick = reset['episode_id'], reset['step_id']
         self.require_native_termination = bool(reset.get('metadata', {}).get('evaluation_case'))
-        self._rpc('begin_combination', teacher_model=MODEL, teacher_model_provider=PROVIDER,
+        self._rpc('begin_combination', teacher_model=self.teacher['model'],
+            teacher_model_provider=self.teacher['provider'],
             context_version=CONTEXT_VERSION, evaluation_method='gpt_only',
             prompt_sha256=self.prompt_sha256, student_policy_version=None, student_policy_sha256=None)
         self._rpc('switch_control_source', source='gpt_eef', reason='GPT-only EEF observation-to-action baseline')
         self.run = dict(schema='robodojo_rollout.run.v1', evaluation_method='gpt_only',
-            teacher='codex_tools', context_version=CONTEXT_VERSION, teacher_model=MODEL,
-            teacher_model_provider=PROVIDER, teacher_reasoning_effort=EFFORT,
+            teacher=self.teacher['name'], context_version=CONTEXT_VERSION,
+            teacher_model=self.teacher['model'],
+            teacher_model_provider=self.teacher['provider'],
+            teacher_reasoning_effort=self.teacher['effort'],
             task=self.task, instruction=self.meta['instruction'], seed=self.seed,
             evaluation_case=reset.get('metadata', {}).get('evaluation_case'), robot_profile=self.profile,
             checkpoint=None, student_backend=None, student_identity_sha256=None,

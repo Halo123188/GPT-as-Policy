@@ -404,7 +404,13 @@ def main():
     parser.add_argument('--task', required=True)
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--evaluation-method', default=evaluation_method(), choices=('pi05_plus_gpt','gpt_only'))
-    parser.add_argument('--codex', required=True)
+    parser.add_argument('--backend', default=os.environ.get('ROLLOUT_BACKEND', 'codex'),
+                        choices=('codex', 'qwen'),
+                        help='codex drives the Codex app-server; qwen drives a local '
+                             'OpenAI-compatible server. The rollout services are identical.')
+    parser.add_argument('--codex', help='Codex executable; required for --backend codex')
+    parser.add_argument('--base-url', help='Chat-completions base URL for --backend qwen')
+    parser.add_argument('--model', help='Served model name for --backend qwen')
     parser.add_argument('--sim-port', type=int, default=19113)
     parser.add_argument('--student-port', type=int, default=18830)
     parser.add_argument('--max-decisions', type=int, default=180, help='0 disables the decision-count limit')
@@ -422,14 +428,28 @@ def main():
                 raise ValueError('Hybrid evaluation requires an explicit checkpoint')
             from ..pi05_server.client import Pi05Client
             student = Pi05Client(args.student_port, args.checkpoint)
-        worker = CodexPolicy(args.output/'codex_workspace', args.codex, method=args.evaluation_method)
+        if args.backend == 'qwen':
+            from ..qwen_backend import settings as qwen_settings
+            from ..qwen_backend.policy import QwenPolicy
+            worker = QwenPolicy(args.output/'agent_workspace', method=args.evaluation_method,
+                                base_url=args.base_url, model=args.model)
+            teacher = dict(name='qwen_tools', model=worker.model,
+                           provider=qwen_settings.PROVIDER,
+                           effort=qwen_settings.REASONING_EFFORT)
+        else:
+            if not args.codex:
+                raise ValueError('The codex backend requires --codex')
+            worker = CodexPolicy(args.output/'codex_workspace', args.codex, method=args.evaluation_method)
+            teacher = None
         if args.evaluation_method == 'gpt_only':
             from ..robodojo_server.gpt_only_client import GPTOnlyTools
             rollout = GPTOnlyTools(args.output, args.task, sim_port=args.sim_port,
-                seed=args.seed, max_decisions=args.max_decisions, prompt_sha256=worker.prompt_sha256)
+                seed=args.seed, max_decisions=args.max_decisions, prompt_sha256=worker.prompt_sha256,
+                teacher=teacher)
         else:
             rollout = RoboDojoTools(args.output, args.task, student, sim_port=args.sim_port,
-                seed=args.seed, max_decisions=args.max_decisions, prompt_sha256=worker.prompt_sha256)
+                seed=args.seed, max_decisions=args.max_decisions, prompt_sha256=worker.prompt_sha256,
+                teacher=teacher)
         worker.run(rollout)
     except BaseException:
         write_json(args.output/'failure.json', dict(error=traceback.format_exc(),

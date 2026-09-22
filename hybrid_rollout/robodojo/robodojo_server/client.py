@@ -25,6 +25,11 @@ from .proposal_diagnostics import action_diagnostics
 ARMS = ('left', 'right')
 
 
+def default_teacher():
+    """Recorded controlling-model identity; a backend may supply its own."""
+    return dict(name='codex_tools', model=MODEL, provider=PROVIDER, effort=EFFORT)
+
+
 def validate_dual_response(response, request):
     if response.get('mode') in ('eef', 'edit'):
         field = 'target' if response['mode'] == 'eef' else 'edit'
@@ -75,7 +80,8 @@ class RoboDojoTools:
         return [{arm: bool(row[i*7+6] < .5) for i, arm in enumerate(ARMS)} for row in executed]
 
     def __init__(self, output, task, student, *, sim_port=19113, seed=0,
-                 max_decisions=180, prompt_sha256='', rpc_factory=RPCClient):
+                 max_decisions=180, prompt_sha256='', rpc_factory=RPCClient, teacher=None):
+        self.teacher = dict(teacher or default_teacher())
         self.output = Path(output).resolve()
         self.task, self.student = task, student
         self.sim_port, self.seed = sim_port, seed
@@ -174,14 +180,15 @@ class RoboDojoTools:
         # infrastructure aborts still use finish() and remain incomplete.
         self.require_native_termination = bool(reset.get('metadata', {}).get('evaluation_case'))
         from ..prompt_context import CONTEXT_VERSION
-        self._rpc('begin_combination', teacher_model=MODEL, teacher_model_provider=PROVIDER,
+        self._rpc('begin_combination', teacher_model=self.teacher['model'],
+                  teacher_model_provider=self.teacher['provider'],
                   context_version=CONTEXT_VERSION,
                   prompt_sha256=self.prompt_sha256,
                   student_policy_version=version, student_policy_sha256=identity)
-        self.run = dict(schema='robodojo_rollout.run.v1', teacher='codex_tools',
+        self.run = dict(schema='robodojo_rollout.run.v1', teacher=self.teacher['name'],
             context_version=CONTEXT_VERSION,
-            teacher_model=MODEL, teacher_model_provider=PROVIDER,
-            teacher_reasoning_effort=EFFORT,
+            teacher_model=self.teacher['model'], teacher_model_provider=self.teacher['provider'],
+            teacher_reasoning_effort=self.teacher['effort'],
             task=self.task, instruction=self.meta['instruction'], seed=self.seed,
             evaluation_case=reset.get('metadata', {}).get('evaluation_case'),
             config=config, robot_profile=self.profile, checkpoint=self.student.metadata['checkpoint'],

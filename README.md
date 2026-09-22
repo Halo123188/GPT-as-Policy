@@ -77,6 +77,45 @@ The summary compares the per-task score and success rate with the leaderboard π
 
 The model is fixed to `gpt-6-astra` with `xhigh` reasoning. No provider fallback is implied. You need your own authorized account or gateway access. Policy/model execution can incur costs. Read the skills and action contract before launching; no simulation or model calls are made by the preview or offline tests.
 
+### Open-weights controller (Qwen, no credentials)
+
+`hybrid_rollout/robodojo/run_qwen.sh` runs either method with a locally served
+open-weights VLM in place of the Codex-hosted model. Everything downstream of the
+controller is unchanged: the same prompt sources, the same tool schemas, the same
+`RoboDojoTools`/`GPTOnlyTools` handlers, the same 5 cm / 0.35 rad bounds, the same
+native scoring. Only the agent driver differs — `qwen_backend/policy.py` speaks
+OpenAI-compatible chat completions instead of the Codex app-server stdio protocol.
+
+```sh
+# 1. One server, any OpenAI-compatible host. Qwen3.8-27B needs ~55 GB for bf16 weights.
+vllm serve Qwen/Qwen3.8-27B --tool-call-parser qwen3_xml --enable-auto-tool-choice \
+    --reasoning-parser qwen3 --max-model-len 98304 --limit-mm-per-prompt '{"image":8}'
+
+# 2. One frozen case. ROLLOUT_EVALUATION_METHOD selects hybrid or direct.
+RUNTIME_ROOT=/path/with/src-RoboDojo_sim-venv_checkpoints \
+ROLLOUT_QWEN_BASE_URL=http://<host>:8000/v1 \
+ROLLOUT_EVALUATION_METHOD=pi05_plus_gpt \
+ROLLOUT_CASE_ID=build_tower__standard__g0__l0 \
+bash hybrid_rollout/robodojo/run_qwen.sh
+
+# 3. Aggregate with the same summary tool as the pi05-only baseline.
+python -m hybrid_rollout.robodojo.pi05_only_summary --results "$RUNTIME_ROOT/results/qwen_hybrid_panel50"
+```
+
+Recorded results carry the real controller identity: `teacher_model` in `run.json`
+and the simulator's `combination.json` name the served model, not `gpt-6-astra`.
+The pinned Codex settings are untouched, so `--backend codex` behaves exactly as before.
+
+Two differences from the Codex runs are deliberate and are stated to the model in
+its prompt. A chat-completions deployment has no shell, file or image-viewing
+tools, so the three (or two) rollout services are the agent's entire toolset; and
+because a frozen episode can exceed a hundred decisions, older cycles are compacted
+— recent observations stay verbatim, earlier ones keep their decision record but
+release attachments and bulk arrays. Both are recorded in `worker.json`. Unlike the
+Codex path, consecutive rejected tool calls are capped
+(`ROLLOUT_QWEN_MAX_CONSECUTIVE_REJECTIONS`, default 40) so an unattended local
+server cannot hold a GPU re-sending one invalid action forever.
+
 ### Deployment and security boundaries
 
 Gateway URLs in `codex_backend/profiles.py` and `codex_backend/config.toml` use reserved `.invalid` placeholders. Configure your own authorized endpoint explicitly in the selected profile and matching configuration, and set `ROLLOUT_GATEWAY_NO_PROXY` for your network if needed. Historical profile identifiers are retained only for compatibility; no company or relay service is configured by this release. The optional SenseCore adapter uses that platform's public control-plane endpoints, not credentials.
